@@ -2,6 +2,8 @@ from datetime import datetime
 import io
 import os
 import re
+import math
+import subprocess
 import hashlib
 import tempfile
 from typing import Dict, List, Tuple, Optional
@@ -37,6 +39,9 @@ HAZARD_KEYWORDS = {
     "volcanic": ("volcano", "eruption", "lava", "ash"),
     "pest_disease": ("pest", "bug", "insect", "locust", "disease", "infected", "fungus"),
 }
+MAX_VIDEO_SECONDS = 10      # only the first N seconds of a clip are analyzed
+TARGET_ANALYSIS_FPS = 8     # frames analyzed per second of video
+SEVERITY_RANK = {"LOW": 0, "MODERATE": 1, "HIGH": 2, "CRITICAL": 3}
 ALL_TARGET_CLASSES = FOREST_CLASSES | ROAD_ANIMAL_CLASSES
 HAZARD_CATEGORIES = {"Wildfire / Fire", "Smoke Detection", "Volcanic Hazard", "Pest / Disease"}
 
@@ -334,6 +339,25 @@ div[data-testid="stSpinner"] i { border-top-color:var(--mint) !important; }
 hr { border-color:var(--line) !important; }
 .foot { text-align:center; margin-top:36px; color:var(--muted); font-size:.82rem; }
 
+/* ---------- Tabs ---------- */
+button[data-baseweb="tab"] { font-family:var(--display); font-weight:600; color:var(--muted); transition:color .25s; }
+button[data-baseweb="tab"]:hover, button[data-baseweb="tab"][aria-selected="true"] { color:var(--white); }
+div[data-baseweb="tab-highlight"] { background:var(--grad) !important; height:3px; border-radius:3px; }
+div[data-baseweb="tab-border"] { background:var(--line); }
+
+/* ---------- Video timeline ---------- */
+.tl-wrap { padding:18px 20px; border-radius:18px; background:var(--glass); border:1px solid var(--line); backdrop-filter:blur(14px); }
+.tl { display:flex; gap:3px; height:48px; }
+.tl .cell { flex:1; min-width:3px; border-radius:6px; background:var(--glass-2); opacity:0;
+  animation:cellIn .5s var(--ease) forwards; animation-delay:calc(var(--i) * 22ms); transition:transform .2s var(--ease); }
+.tl .cell:hover { transform:scaleY(1.18); }
+.tl .cell.on { background:var(--sev); box-shadow:0 0 14px -2px var(--sev); }
+@keyframes cellIn { from { opacity:0; transform:scaleY(.2); } to { opacity:1; transform:none; } }
+.t-critical { --sev:#ff5470; } .t-high { --sev:#ffb547; } .t-moderate { --sev:#f4de72; } .t-low { --sev:#34e3b0; }
+.tl-axis { display:flex; justify-content:space-between; margin-top:8px; color:var(--muted); font-size:.78rem; }
+.tl-legend { display:flex; flex-wrap:wrap; gap:16px; margin-top:12px; font-size:.8rem; color:var(--muted); }
+.tl-legend i { display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:6px; background:var(--sev); }
+
 /* ---------- Keyboard focus + responsive + reduced motion ---------- */
 button:focus-visible, input:focus-visible, [role="radio"]:focus-visible { outline:2px solid var(--mint) !important; outline-offset:3px; }
 @media (max-width:980px) {
@@ -574,6 +598,261 @@ def encode_png_bytes(rgb_array: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
+def transcode_h264(src: str, dst: str) -> bool:
+    """Re-encode to browser-playable H.264. Returns False if ffmpeg is unavailable."""
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        subprocess.run(
+            [exe, "-y", "-i", src, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-preset", "veryfast", "-movflags", "+faststart", "-an", dst],
+            check=True, capture_output=True, timeout=180,
+        )
+        return os.path.exists(dst) and os.path.getsize(dst) > 0
+    except Exception:
+        return False
+
+
+def analyze_video(video_path, model, monitoring_mode, confidence, use_color_scan, progress_cb=None):
+    """Analyze the first MAX_VIDEO_SECONDS of a clip and return a summary dict."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError("Could not open this video. Try an MP4 file.")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+    if fps < 1 or fps > 240:
+        fps = 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if src_w < 2 or src_h < 2:
+        raise ValueError("The video has no readable frames.")
+
+    max_frames = int(MAX_VIDEO_SECONDS * fps)
+    limit = min(total, max_frames) if total > 0 else max_frames
+    truncated = total > max_frames
+    stride = max(1, int(round(fps / TARGET_ANALYSIS_FPS)))
+    out_fps = fps / stride
+    scale = min(1.0, 960.0 / max(src_w, src_h))
+    out_w = max(2, int(src_w * scale) // 2 * 2)
+    out_h = max(2, int(src_h * scale) // 2 * 2)
+    to_analyze = max(1, math.ceil(limit / stride))
+
+    tmp_dir = tempfile.mkdtemp(prefix="wildlife_video_")
+    raw_path = os.path.join(tmp_dir, "raw.mp4")
+    h264_path = os.path.join(tmp_dir, "annotated.mp4")
+    writer = cv2.VideoWriter(raw_path, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (out_w, out_h))
+
+    groups: Dict[Tuple[str, str], Dict[str, object]] = {}
+    timeline: List[Tuple[float, int, int]] = []   # (time, max severity rank or -1, detections)
+    keyframes: List[Tuple[Tuple[int, int, float], float, np.ndarray]] = []
+    analyzed = 0
+    idx = 0
+    try:
+        while idx < limit:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if idx % stride == 0:
+                t = idx / fps
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                if (rgb.shape[1], rgb.shape[0]) != (out_w, out_h):
+                    rgb = cv2.resize(rgb, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                annotated, dets = process_image(Image.fromarray(rgb), model, monitoring_mode, confidence, use_color_scan)
+                writer.write(cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+                analyzed += 1
+
+                top_rank, top_conf = -1, 0.0
+                for d in dets:
+                    rank = SEVERITY_RANK.get(str(d["Severity"]), 0)
+                    conf_val = float(str(d["Confidence"]).rstrip("%"))
+                    top_rank = max(top_rank, rank)
+                    top_conf = max(top_conf, conf_val)
+                    g = groups.setdefault((str(d["Category"]), str(d["Object"])), {
+                        "first": t, "last": t, "frames": 0, "best": d, "best_key": (-1, -1.0),
+                    })
+                    g["last"] = t
+                    g["frames"] += 1
+                    if (rank, conf_val) > g["best_key"]:
+                        g["best_key"], g["best"] = (rank, conf_val), d
+                timeline.append((t, top_rank, len(dets)))
+                if dets:
+                    keyframes.append(((top_rank, len(dets), top_conf), t, annotated))
+                    keyframes.sort(key=lambda k: k[0], reverse=True)
+                    del keyframes[12:]
+                if progress_cb:
+                    progress_cb(analyzed, to_analyze)
+            idx += 1
+    finally:
+        writer.release()
+        cap.release()
+
+    if analyzed == 0:
+        raise ValueError("No frames could be read from this video.")
+
+    playable = transcode_h264(raw_path, h264_path)
+    with open(h264_path if playable else raw_path, "rb") as f:
+        video_bytes = f.read()
+    for name in (raw_path, h264_path):
+        if os.path.exists(name):
+            os.remove(name)
+    os.rmdir(tmp_dir)
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    events: List[Dict[str, object]] = []
+    for (category, obj), g in groups.items():
+        best = g["best"]
+        events.append({
+            "Timestamp": stamp,
+            "Category": category,
+            "Object": obj,
+            "Confidence": f"{g['best_key'][1]:.1f}%",
+            "Proximity": best["Proximity"],
+            "Severity": best["Severity"],
+            "Road Context": best["Road Context"],
+            "Advisory": best["Advisory"],
+            "Source": "Video",
+            "Seen": f"{g['first']:.1f}s to {g['last']:.1f}s, {g['frames']} frames",
+        })
+    events.sort(key=lambda e: SEVERITY_RANK.get(str(e["Severity"]), 0), reverse=True)
+
+    picked: List[Tuple[float, np.ndarray]] = []
+    for _, t, img in keyframes:
+        if all(abs(t - pt) >= 0.5 for pt, _ in picked):
+            picked.append((t, img))
+        if len(picked) == 3:
+            break
+
+    return {
+        "events": events, "timeline": timeline, "keyframes": picked,
+        "video_bytes": video_bytes, "playable": playable, "analyzed": analyzed,
+        "seconds": min(limit / fps, MAX_VIDEO_SECONDS) if limit else 0.0,
+        "truncated": truncated, "source_seconds": (total / fps) if total else 0.0,
+    }
+
+
+def render_timeline(timeline, seconds: float) -> None:
+    names = {3: "critical", 2: "high", 1: "moderate", 0: "low"}
+    cells = []
+    for i, (t, rank, count) in enumerate(timeline):
+        if rank < 0:
+            cells.append(f'<span class="cell" style="--i:{i}" title="{t:.1f}s: nothing detected"></span>')
+        else:
+            cells.append(f'<span class="cell on t-{names[rank]}" style="--i:{i}" title="{t:.1f}s: {count} detection(s), {names[rank]}"></span>')
+    st.markdown(
+        '<div class="tl-wrap"><div class="tl">' + "".join(cells) + '</div>'
+        f'<div class="tl-axis"><span>0 s</span><span>{seconds:.1f} s</span></div>'
+        '<div class="tl-legend">'
+        '<span class="t-critical"><i></i>Critical</span><span class="t-high"><i></i>High</span>'
+        '<span class="t-moderate"><i></i>Moderate</span><span class="t-low"><i></i>Low</span></div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_video_workspace(model_path, monitoring_mode, confidence, use_color_scan) -> None:
+    left, right = st.columns([1.05, 1.25], gap="large")
+    with left:
+        video_file = st.file_uploader(
+            "Upload a short video", type=["mp4", "mov", "avi", "mkv", "webm"], key="video_evidence"
+        )
+        st.caption(f"Short clips only. The first {MAX_VIDEO_SECONDS} seconds are analyzed.")
+        if video_file is not None:
+            st.video(video_file.getvalue())
+    with right:
+        st.markdown(
+            f'<div class="panel rise" style="--i:4"><div class="panel-title">How video analysis works</div>'
+            f'<p class="small-muted" style="margin:0 0 10px">About {TARGET_ANALYSIS_FPS} frames per second are checked with the same '
+            f'{monitoring_mode} settings as photos.</p>'
+            f'<p style="margin:0">Repeated detections of the same object are merged into one alert, so a 5 second clip gives you a short '
+            f'list to review, a timeline of when the risk appeared, and an annotated video.</p></div>',
+            unsafe_allow_html=True,
+        )
+
+    if video_file is None or model_path is None:
+        return
+
+    file_key = f"{video_file.name}_{video_file.size}"
+    st.write("")
+    if st.button("Analyze video", key="analyze_video_btn"):
+        suffix = os.path.splitext(video_file.name)[1] or ".mp4"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(video_file.getvalue())
+        tmp.close()
+        progress = st.progress(0.0, text="Starting analysis...")
+
+        def on_progress(done, total):
+            progress.progress(min(1.0, done / max(total, 1)), text=f"Analyzing frame {done} of {total}...")
+
+        try:
+            model = load_model(model_path)
+            result = analyze_video(tmp.name, model, monitoring_mode, confidence, use_color_scan, on_progress)
+            for e in result["events"]:
+                e["Source"] = f"Video: {video_file.name}"
+            st.session_state.event_log.extend(result["events"])
+            st.session_state.video_result = {
+                "file_key": file_key, "result": result,
+                "settings": f"{monitoring_mode}, confidence {confidence:.0%}",
+            }
+        except Exception as exc:
+            st.session_state.video_result = None
+            st.error(f"Video analysis failed: {exc}")
+            st.caption("Try an MP4 (H.264) file, and check that your OpenCV and Ultralytics versions are compatible.")
+        finally:
+            progress.empty()
+            os.remove(tmp.name)
+
+    saved = st.session_state.get("video_result")
+    if not saved or saved["file_key"] != file_key:
+        st.info("Press **Analyze video** to scan this clip.")
+        return
+
+    res = saved["result"]
+    events = res["events"]
+    peak = max((SEVERITY_RANK.get(str(e["Severity"]), 0) for e in events), default=-1)
+    peak_label = {3: "Critical", 2: "High", 1: "Moderate", 0: "Low"}.get(peak, "None")
+
+    section("Video analysis results", f"{res['analyzed']} frames checked, settings: {saved['settings']}")
+    if res["truncated"]:
+        st.warning(f"This clip is {res['source_seconds']:.1f} s long. Only the first {MAX_VIDEO_SECONDS} s were analyzed.")
+    a, b, c, d = st.columns(4)
+    a.metric("Clip length", f"{res['seconds']:.1f} s")
+    b.metric("Frames checked", res["analyzed"])
+    c.metric("Alerts", len(events))
+    d.metric("Peak severity", peak_label)
+
+    st.markdown("#### Risk timeline")
+    render_timeline(res["timeline"], res["seconds"])
+    hit_frames = sum(1 for _, rank, _ in res["timeline"] if rank >= 0)
+    st.caption(f"Something was detected in {hit_frames} of {len(res['timeline'])} checked frames. Hover a block to see its time.")
+
+    st.write("")
+    v_col, k_col = st.columns([1.2, 1], gap="large")
+    with v_col:
+        st.markdown("#### Annotated video")
+        st.video(res["video_bytes"])
+        if not res["playable"]:
+            st.caption("This preview may not play in your browser because H.264 encoding was unavailable. Install imageio-ffmpeg, or download the file.")
+        st.download_button(
+            "Download annotated video", data=res["video_bytes"],
+            file_name=f"wildlife_safety_{video_file.name.rsplit('.', 1)[0]}.mp4",
+            mime="video/mp4", use_container_width=True,
+        )
+    with k_col:
+        st.markdown("#### Key moments")
+        if res["keyframes"]:
+            for t, img in res["keyframes"]:
+                st.image(img, caption=f"At {t:.1f} s", use_container_width=True)
+        else:
+            st.caption("No detections to show.")
+
+    if events:
+        section("Alerts to review", f"{len(events)} merged from this clip")
+        for i, e in enumerate(events):
+            render_alert(e, i)
+        st.dataframe(pd.DataFrame(events), use_container_width=True, hide_index=True)
+    else:
+        st.success("Nothing matching this monitoring module was found in the clip above the confidence threshold.")
+
+
 def section(title: str, hint: str = "") -> None:
     hint_html = f"<small>{hint}</small>" if hint else ""
     st.markdown(f'<div class="sec"><span class="bar"></span><h3>{title}</h3>{hint_html}</div>', unsafe_allow_html=True)
@@ -585,7 +864,8 @@ def render_alert(detection: Dict[str, object], index: int) -> None:
         f'<div class="alert sev-{sev}" style="--i:{index}">'
         f'<span class="sev">{detection["Severity"].title()}</span>'
         f'<div><div class="head">{detection["Category"]}</div>'
-        f'<div class="meta">{detection["Object"]} at {detection["Confidence"]} confidence, proximity {detection["Proximity"].lower()}</div>'
+        f'<div class="meta">{detection["Object"]} at {detection["Confidence"]} confidence, proximity {detection["Proximity"].lower()}'
+        f'{", seen " + str(detection["Seen"]) if detection.get("Seen") and detection["Seen"] != "Single frame" else ""}</div>'
         f'<div class="body">{detection["Advisory"]}</div></div></div>',
         unsafe_allow_html=True,
     )
@@ -631,7 +911,7 @@ def main() -> None:
         <div class="hero rise" style="--i:1">
             <div>
                 <h1>Protect wildlife. Prevent road incidents.</h1>
-                <p>Upload camera evidence and get instant alerts for forest intrusion, animals near traffic and environmental hazards, each with a severity level and a clear next step.</p>
+                <p>Upload a photo or a short video clip and get instant alerts for forest intrusion, animals near traffic and environmental hazards, each with a severity level and a clear next step.</p>
                 <div class="chips">
                     <span>Object detection</span><span>Intrusion awareness</span><span>Road-risk checks</span><span>Event logging</span>
                 </div>
@@ -686,73 +966,80 @@ def main() -> None:
 
     render_stats(pd.DataFrame(st.session_state.event_log))
 
-    section("Detection workspace", "Upload an image to begin")
-    left, right = st.columns([1.05, 1.25], gap="large")
-    with left:
-        uploaded_file = st.file_uploader("Upload image evidence", type=["jpg", "jpeg", "png"], key="evidence")
-        st.caption("JPG, JPEG or PNG.")
-        if uploaded_file is not None:
-            st.image(uploaded_file, caption="Evidence image", use_container_width=True)
+    section("Detection workspace", "Analyze a photo or a short video")
+    image_tab, video_tab = st.tabs(["Photo analysis", "Short video analysis"])
+    with image_tab:
+        left, right = st.columns([1.05, 1.25], gap="large")
+        with left:
+            uploaded_file = st.file_uploader("Upload image evidence", type=["jpg", "jpeg", "png"], key="evidence")
+            st.caption("JPG, JPEG or PNG.")
+            if uploaded_file is not None:
+                st.image(uploaded_file, caption="Evidence image", use_container_width=True)
 
-    with right:
-        st.markdown(
-            f'<div class="panel rise" style="--i:4"><div class="panel-title">{monitoring_mode}</div>'
-            f'<p class="small-muted" style="margin:0 0 10px">Confidence threshold {confidence:.0%}</p>'
-            f'<p style="margin:0">Each detection is categorized, given a severity level, and added to the session event log.</p></div>',
-            unsafe_allow_html=True,
-        )
-        st.write("")
-        if monitoring_mode == "Environmental Hazards":
-            st.info("Fire and smoke are found by the built-in colour scan (switch it on in the sidebar). Pests and disease still need a custom-trained model.")
-        elif monitoring_mode == "Forest Intrusion":
-            st.info("The baseline model detects the COCO 'person' class. A detection is an indicator, not proof of unauthorized entry.")
-        elif monitoring_mode == "Wildlife & Road Safety":
-            st.info("The baseline model recognizes common COCO animal classes. It cannot tell whether an animal is physically on a road.")
-
-    if uploaded_file is not None and model_path is not None:
-        try:
-            pil_image = Image.open(uploaded_file).convert("RGB")
-            model = load_model(model_path)
-            with st.spinner("Scanning image for wildlife, intrusion and hazards..."):
-                annotated_img, detections = process_image(pil_image, model, monitoring_mode, confidence, use_color_scan)
-
-            process_key = f"{uploaded_file.name}_{uploaded_file.size}_{monitoring_mode}_{confidence:.2f}_{model_path}_{use_color_scan}"
-            if st.session_state.last_processed_key != process_key:
-                st.session_state.event_log.extend(detections)
-                st.session_state.last_processed_key = process_key
-
-            section("Analysis results", "What the model found")
-            a, b, c = st.columns(3)
-            a.metric("Objects detected", len(detections))
-            b.metric("High or critical", sum(d["Severity"] in {"HIGH", "CRITICAL"} for d in detections))
-            c.metric("Image status", "Needs review" if any(d["Severity"] in {"HIGH", "CRITICAL"} for d in detections) else "Reviewed")
-
+        with right:
+            st.markdown(
+                f'<div class="panel rise" style="--i:4"><div class="panel-title">{monitoring_mode}</div>'
+                f'<p class="small-muted" style="margin:0 0 10px">Confidence threshold {confidence:.0%}</p>'
+                f'<p style="margin:0">Each detection is categorized, given a severity level, and added to the session event log.</p></div>',
+                unsafe_allow_html=True,
+            )
             st.write("")
-            original_col, result_col = st.columns(2, gap="large")
-            with original_col:
-                st.markdown("#### Original")
-                st.image(pil_image, use_container_width=True)
-            with result_col:
-                st.markdown("#### Detections")
-                st.image(annotated_img, use_container_width=True)
-                st.download_button(
-                    "Download annotated image",
-                    data=encode_png_bytes(annotated_img),
-                    file_name=f"wildlife_safety_{uploaded_file.name.rsplit('.', 1)[0]}.png",
-                    mime="image/png",
-                    use_container_width=True,
-                )
+            if monitoring_mode == "Environmental Hazards":
+                st.info("Fire and smoke are found by the built-in colour scan (switch it on in the sidebar). Pests and disease still need a custom-trained model.")
+            elif monitoring_mode == "Forest Intrusion":
+                st.info("The baseline model detects the COCO 'person' class. A detection is an indicator, not proof of unauthorized entry.")
+            elif monitoring_mode == "Wildlife & Road Safety":
+                st.info("The baseline model recognizes common COCO animal classes. It cannot tell whether an animal is physically on a road.")
 
-            if detections:
-                section("Alerts to review", f"{len(detections)} generated from this image")
-                for i, detection in enumerate(detections):
-                    render_alert(detection, i)
-                st.dataframe(pd.DataFrame(detections), use_container_width=True, hide_index=True)
-            else:
-                st.success("Nothing matching this monitoring module was found above the confidence threshold.")
-        except Exception as exc:
-            st.error(f"Detection failed: {exc}")
-            st.caption("Check that the model file is valid and that your installed Ultralytics and OpenCV versions are compatible.")
+        if uploaded_file is not None and model_path is not None:
+            try:
+                pil_image = Image.open(uploaded_file).convert("RGB")
+                model = load_model(model_path)
+                with st.spinner("Scanning image for wildlife, intrusion and hazards..."):
+                    annotated_img, detections = process_image(pil_image, model, monitoring_mode, confidence, use_color_scan)
+                for d in detections:
+                    d["Source"], d["Seen"] = "Image", "Single frame"
+
+                process_key = f"{uploaded_file.name}_{uploaded_file.size}_{monitoring_mode}_{confidence:.2f}_{model_path}_{use_color_scan}"
+                if st.session_state.last_processed_key != process_key:
+                    st.session_state.event_log.extend(detections)
+                    st.session_state.last_processed_key = process_key
+
+                section("Analysis results", "What the model found")
+                a, b, c = st.columns(3)
+                a.metric("Objects detected", len(detections))
+                b.metric("High or critical", sum(d["Severity"] in {"HIGH", "CRITICAL"} for d in detections))
+                c.metric("Image status", "Needs review" if any(d["Severity"] in {"HIGH", "CRITICAL"} for d in detections) else "Reviewed")
+
+                st.write("")
+                original_col, result_col = st.columns(2, gap="large")
+                with original_col:
+                    st.markdown("#### Original")
+                    st.image(pil_image, use_container_width=True)
+                with result_col:
+                    st.markdown("#### Detections")
+                    st.image(annotated_img, use_container_width=True)
+                    st.download_button(
+                        "Download annotated image",
+                        data=encode_png_bytes(annotated_img),
+                        file_name=f"wildlife_safety_{uploaded_file.name.rsplit('.', 1)[0]}.png",
+                        mime="image/png",
+                        use_container_width=True,
+                    )
+
+                if detections:
+                    section("Alerts to review", f"{len(detections)} generated from this image")
+                    for i, detection in enumerate(detections):
+                        render_alert(detection, i)
+                    st.dataframe(pd.DataFrame(detections), use_container_width=True, hide_index=True)
+                else:
+                    st.success("Nothing matching this monitoring module was found above the confidence threshold.")
+            except Exception as exc:
+                st.error(f"Detection failed: {exc}")
+                st.caption("Check that the model file is valid and that your installed Ultralytics and OpenCV versions are compatible.")
+
+    with video_tab:
+        render_video_workspace(model_path, monitoring_mode, confidence, use_color_scan)
 
     section("Event log", "Everything recorded this session")
     if st.session_state.event_log:
@@ -768,7 +1055,7 @@ def main() -> None:
                 st.session_state.last_processed_key = None
                 st.rerun()
     else:
-        st.markdown('<div class="empty"><span class="em">🛰️</span><b>No events yet</b><span class="small-muted">Upload an image above and its detections will appear here.</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="empty"><span class="em">🛰️</span><b>No events yet</b><span class="small-muted">Analyze a photo or video above and its detections will appear here.</span></div>', unsafe_allow_html=True)
 
     st.markdown(
         '<p class="foot">Prototype decision-support system. Verify alerts in the field before taking operational action.</p>',
